@@ -250,7 +250,7 @@ def calc(name, seq_len,
         attn_bda_out + mlp_norm_out + mlp_norm_rms +\
         router_probs + final_probs + permute_row_id_map + \
         share_linear_1_input_fp8 + share_linear_1_out + share_linear_2_input_fp8 + \
-        expert_linear_1_input_fp8 + expert_linear_1_out + expert_linear_2_input_fp8 + unpermute_alltoall_out
+        expert_linear_1_input_fp8 + expert_linear_1_out + expert_linear_2_input_fp8
     # cached 为1层模型forward产生的中间激活的总和，单位MB
     # 需要注意，cached目前同时计入了attn_out和其fp8 cast output也就是attn_out_proj_input_fp8
     cached_layer_num = layers_per_pp * (pp - 0)
