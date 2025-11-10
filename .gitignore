@@ -12,3 +12,5 @@ events.*
 nemo-scripts/results/*
 nemo-scripts/nemo_experiments/*
 *.tmp
+
+run_mem_estim.sh

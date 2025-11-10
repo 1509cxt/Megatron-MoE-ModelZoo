@@ -162,6 +162,7 @@ def calc(name, seq_len,
 
     topk = n_activated_experts - shared_expert_num
     bf16_mb_coeff = 2 / 1024 / 1024
+    fp8_mb_coeff = 1 / 1024 / 1024
     fp8_per_block_mb_coeff = 1 / 1024 / 1024 if fp8_per_block_free_rowwise_afer_fwd else bf16_mb_coeff
     fp8_per_block_mb_coeff *= 1.03125 # fp32 scaling factor for each 128 elements
     fp32_mb_coeff = 4 / 1024 / 1024
@@ -218,8 +219,12 @@ def calc(name, seq_len,
     permutated_local_input_tokens = expert_capacity * (n_experts - shared_expert_num) * 1 * n_embed / tp * bf16_mb_coeff
     permuted_probs = expert_capacity * (n_experts - shared_expert_num) * 1 * fp32_mb_coeff
     reversed_local_input_permutation_mapping = (n_experts - shared_expert_num) * 1 * n_embed / tp * int64_mb_coeff
-    
-    permute_out = expert_capacity * (n_experts - shared_expert_num) * 1 * n_embed / tp * bf16_mb_coeff
+
+    #k = 97299 / (seq_len * topk)  # without expert capacity dropping token, without pad to capacity
+    k = 1
+    permute_out = seq_len * topk * dense_dp / ep * k * 1 * n_embed / tp * bf16_mb_coeff 
+    # seq_len * topk == expert_capacity * (n_experts - shared_expert_num)
+    # seq_len * topk * dense_dp / ep * k
 
     share_linear_1_input_fp8 = seq_len * 1 * n_embed * fp8_per_block_mb_coeff # cached, 这个就是所谓的shared_AG_out
     share_linear_1_out = seq_len * 1 * moe_ffn_hidden / tp * shared_expert_num * 2 * bf16_mb_coeff
@@ -231,21 +236,21 @@ def calc(name, seq_len,
     share_linear_2_out = seq_len * 1 * n_embed / tp * bf16_mb_coeff
     
     expert_linear_1_input_fp8 = permute_out / bf16_mb_coeff * fp8_per_block_mb_coeff # cached
-    expert_linear_1_out = expert_capacity / tp * etp * (n_experts - shared_expert_num) * 1 * moe_ffn_hidden / etp * 2 * bf16_mb_coeff  # cached
-    flops_expert_linear_1_out = expert_capacity / tp * etp * (n_experts - shared_expert_num) * 1 * moe_ffn_hidden / etp * 2 * n_embed * 2
+    expert_linear_1_out = seq_len * topk * dense_dp / ep * k * 1 * moe_ffn_hidden / etp * 2 * bf16_mb_coeff  # cached
+    flops_expert_linear_1_out = seq_len * topk * dense_dp / ep * k / tp * etp * 1 * moe_ffn_hidden / etp * 2 * n_embed * 2
     # 首次grouped_gemm 会额外申请Workspace 16.3125 MB
     
     expert_act_out = expert_linear_1_out / 2 
     
     expert_linear_2_input_fp8 = expert_act_out / bf16_mb_coeff * fp8_per_block_mb_coeff # cached
-    expert_linear_2_out = expert_capacity / tp * etp * (n_experts - shared_expert_num) * 1 * n_embed * bf16_mb_coeff
+    expert_linear_2_out = seq_len * topk * dense_dp / ep * k / tp * etp * 1 * n_embed * bf16_mb_coeff
     
     
     unpermute_alltoall_out = expert_linear_2_out / etp # cached
     
-    unpermute_out = seq_len * 1 * n_embed
+    unpermute_out = unpermute_alltoall_out / topk
     mlp_bda_out = unpermute_out
-    routed_expert_cached = expert_linear_1_input_fp8 + expert_linear_1_out + expert_linear_2_input_fp8 + unpermute_alltoall_out
+    routed_expert_cached = expert_linear_1_input_fp8 + expert_linear_1_out + expert_linear_2_input_fp8
     cached = input_mem + input_norm_rms + q_down_input_fp8 +q_down_out + kv_down_input_fp8 + q_norm_out_fp8 + q_norm_rms + kv_compressed + kv_norm_out_fp8 + kv_norm_rms + q_apply_rope_out + k_apply_rope_out + v_apply_rope_out + attn_out + attn_out_proj_input_fp8 + attn_ctx_tensor + \
         attn_bda_out + mlp_norm_out + mlp_norm_rms +\
         router_probs + final_probs + permute_row_id_map + \
@@ -253,13 +258,42 @@ def calc(name, seq_len,
         expert_linear_1_input_fp8 + expert_linear_1_out + expert_linear_2_input_fp8
     # cached 为1层模型forward产生的中间激活的总和，单位MB
     # 需要注意，cached目前同时计入了attn_out和其fp8 cast output也就是attn_out_proj_input_fp8
+    # unpermute_alltoall_out 在不开启permute-fusion时不计入cached，开启permute-fusion时应当被优化掉
     cached_layer_num = layers_per_pp * (pp - 0)
     if vpp > 1:
         cached_layer_num += (layers_per_pp // vpp) * (pp - 1)
-    cached_layer_num += 0.85 # backward temp
+    
     cached_t = cached * cached_layer_num
-    
-    
+    # backward_temp = cached * 0.85 # dsv2
+    # backward_temp = unpermute_alltoall_out + \
+    #     n_embed * moe_ffn_hidden * bf16_mb_coeff * (n_experts - shared_expert_num) / ep + \
+    #     n_embed * moe_ffn_hidden * 2 * bf16_mb_coeff * (n_experts - shared_expert_num) / ep + \
+    #     n_embed * moe_ffn_hidden * bf16_mb_coeff * shared_expert_num + \
+    #     n_embed * moe_ffn_hidden * 2 * bf16_mb_coeff * shared_expert_num + \
+    #     permute_out + \
+    #     mlp_norm_out + \
+    #     n_layers * n_embed * n_head * v_head_dim * fp8_mb_coeff + \
+    #     n_layers * kv_lora_rank * n_head * v_head_dim * bf16_mb_coeff + \
+    #     q_lora_rank * n_head * qk_head_dim * bf16_mb_coeff + \
+    #     n_embed * (kv_lora_rank + rope_head_dim) * bf16_mb_coeff + \
+    #     n_embed * q_lora_rank * bf16_mb_coeff + \
+    #     n_embed * vocab_size * bf16_mb_coeff
+    # """
+    # a2a combine bwd temp 
+    # expert_linear_2 bwd wgrad temp
+    # expert_linear_1 bwd wgrad temp
+    # share_linear_2 bwd wgrad temp
+    # share_linear_1 bwd wgrad temp
+    # a2a dispatch bwd temp
+    # mlp_norm_out bwd dgrad temp
+    # attn O project bwd wgrad temp
+    # V LoRA B proj wgrad temp
+    # Q LoRA B proj wgrad temp
+    # KV LoRA A proj wgrad temp
+    # Q LoRA A proj wgrad temp
+    # input embedding bwd wgrad temp
+    # """ GradAccumulationfusion change wgrad dtype
+    backward_temp = unpermute_alltoall_out + expert_act_out * 12 - expert_linear_2_input_fp8
     #cached_t += (seq_len * 1 * n_embed / tp * bf16_mb_coeff) * (vpp+1)  # vpp/pp stage's p2p buffer
     embedding_memory_param_grad_optimizer = n_embed * vocab_size * (6+12/dense_dp) / 1024**3
     pass
@@ -296,9 +330,11 @@ def calc(name, seq_len,
 
     # print()
     # print(f' -- cached micobatch layer num: {cached_layer_num}')
-    # print(f' -- total cached for 1 layer and 1 micobatch: {cached} MB')
+    print(f' -- total cached for 1 layer and 1 micobatch: {cached} MB')
     # print(f' -- cached for all PP microbatches: {cached_t / 1024} GB')
-    print(f' -- total usage {rank_dense_mem + rank_moe_mem + embedding_memory_param_grad_optimizer + cached_t / 1024} GB')
+    print(f' -- model param + grad + optimizer states memory: {rank_dense_mem + rank_moe_mem + embedding_memory_param_grad_optimizer} GB')
+    print(f' -- model param + grad + optimizer states + activation memory: {rank_dense_mem + rank_moe_mem + embedding_memory_param_grad_optimizer + cached_t / 1024} GB')
+    print(f' -- total usage {rank_dense_mem + rank_moe_mem + embedding_memory_param_grad_optimizer + (cached_t + backward_temp) / 1024 } GB')
     # print()
 
     # print(f' -- full recompute total cached for 1 layer and 1 micobatch: {input_mem} MB')
