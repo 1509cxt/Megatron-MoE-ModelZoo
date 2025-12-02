@@ -399,7 +399,7 @@ def calc(name, seq_len,
     total_MB_PP_rank0 = total_GB_PP_rank0 * 1024
     print(f' --- [PP rank 0] total usage after recompute & offloading {total_GB_PP_rank0} GB')
     print(f' --- [PP rank 0] total usage after recompute & offloading {total_MB_PP_rank0} MB')
-    total_GB_PP_rank1 = rank_dense_mem + rank_moe_mem + embedding_memory_param_grad_optimizer + (cached_after_recompute_offloading + backward_temp) / 1024
+    total_GB_PP_rank1 = rank_dense_mem + rank_moe_mem + (cached_after_recompute_offloading + backward_temp) / 1024
     total_MB_PP_rank1 = total_GB_PP_rank1 * 1024
     print(f' --- [PP rank 1] total usage after recompute & offloading {total_GB_PP_rank1} GB')
     print(f' --- [PP rank 1] total usage after recompute & offloading {total_MB_PP_rank1} MB')
@@ -445,8 +445,8 @@ if __name__ == '__main__':
         ffn_hidden=18432, moe_ffn_hidden=2048,
         q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
         rope_head_dim=64, v_head_dim=128, first_k_dense=1,
-        shared_expert_num=1, mtp=1, gpus=8 * 1024, pp=16, vpp=1, ep=8, tp=1, etp=1, 
-        layers_per_pp=4, fsdp=False, fp8=True, fp8_per_block_free_rowwise_afer_fwd=True, routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 4)
+        shared_expert_num=1, mtp=1, gpus=8 * 1024, pp=32, vpp=1, ep=8, tp=1, etp=1, 
+        layers_per_pp=2, fsdp=False, fp8=True, fp8_per_block_free_rowwise_afer_fwd=True, routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 4)
     # kimi-k2: 61 layers = 1 dense layer + 60 moe layers + lm head. 1 mtp layer = 1 moe layer + 1 lm head + 1 2H->H Projection. 
     
     # calc('ling-1t-MLA', seq_len=4096,
