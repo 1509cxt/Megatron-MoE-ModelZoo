@@ -1,1 +1,0 @@
-python -m debugpy --connect 10025 deepseek_fp8_perblock_mem_estimate.py
