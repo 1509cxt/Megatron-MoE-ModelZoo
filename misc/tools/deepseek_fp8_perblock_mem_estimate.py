@@ -261,7 +261,7 @@ def calc(name, seq_len,
     unpermute_out = unpermute_alltoall_out / topk
     mlp_bda_out = unpermute_out
     routed_expert_cached = expert_linear_1_input_fp8 + expert_linear_1_out + expert_linear_2_input_fp8
-    cached = input_mem + input_norm_rms + q_down_input_fp8 +q_down_out + kv_down_input_fp8 + q_norm_out_fp8 + q_norm_rms + kv_compressed + kv_norm_out_fp8 + kv_norm_rms + q_apply_rope_out + k_apply_rope_out + v_apply_rope_out + attn_out + attn_out_proj_input_fp8 + attn_ctx_tensor + \
+    cached = input_mem + input_norm_rms + q_down_input_fp8 +q_down_out + kv_down_input_fp8 + kv_down_out + q_norm_out_fp8 + q_norm_rms + kv_compressed + kv_norm_out_fp8 + kv_norm_rms + q_apply_rope_out + k_apply_rope_out + v_apply_rope_out + attn_out + attn_out_proj_input_fp8 + attn_ctx_tensor + \
         attn_bda_out + mlp_norm_out + mlp_norm_rms +\
         router_probs + final_probs + permute_row_id_map + \
         share_linear_1_input_fp8 + share_linear_1_out + share_linear_2_input_fp8 + \
@@ -337,16 +337,18 @@ def calc(name, seq_len,
     print(f' -- total cached for 1 MoE transformer layer and 1 micobatch: {cached} MB')
     print(f' -- total cached for 1 Dense transformer layer and 1 micobatch: {dense_mlp_transformer_layer_cached} MB')
     # print(f' -- cached for all PP microbatches: {cached_total_PPrank1 / 1024} GB')
-    print(f' -- [PP rank 0] model param + grad + optimizer states memory: {embedding_memory_param_grad_optimizer + rank_dense_layer_mem * first_k_dense + (rank_dense_mem + rank_moe_mem) / layers_per_pp * (layers_per_pp - first_k_dense)} GB')
-    print(f' -- [PP rank 1] model param + grad + optimizer states memory: {rank_dense_mem + rank_moe_mem} GB')
-    print(f' -- [PP rank 0] model param + grad + optimizer states + activation memory: {embedding_memory_param_grad_optimizer + rank_dense_layer_mem * first_k_dense + (rank_dense_mem + rank_moe_mem) / layers_per_pp * (layers_per_pp - first_k_dense) + cached_total_PPrank0 / 1024} GB')
-    print(f' -- [PP rank 1] model param + grad + optimizer states + activation memory: {rank_dense_mem + rank_moe_mem + embedding_memory_param_grad_optimizer + cached_total_PPrank1 / 1024} GB')
-    
-    total_GB_PP_rank0 = embedding_memory_param_grad_optimizer + rank_dense_layer_mem * first_k_dense + (rank_dense_mem + rank_moe_mem) / layers_per_pp * (layers_per_pp - first_k_dense) + (cached_total_PPrank0 + backward_temp) / 1024
+    model_param_grad_optimizer_PP_rank0 = embedding_memory_param_grad_optimizer + rank_dense_layer_mem * first_k_dense + (rank_dense_mem + rank_moe_mem) / layers_per_pp * (layers_per_pp - first_k_dense)
+    model_param_grad_optimizer_PP_rank1 = rank_dense_mem + rank_moe_mem
+    print(f' -- [PP rank 0] model param + grad + optimizer states memory: {model_param_grad_optimizer_PP_rank0 / 1024} GB')
+    print(f' -- [PP rank 1] model param + grad + optimizer states memory: {model_param_grad_optimizer_PP_rank1 / 1024} GB')
+    print(f' -- [PP rank 0] model param + grad + optimizer states + activation memory: {model_param_grad_optimizer_PP_rank0 + cached_total_PPrank0 / 1024} GB')
+    print(f' -- [PP rank 1] model param + grad + optimizer states + activation memory: {model_param_grad_optimizer_PP_rank1 + cached_total_PPrank1 / 1024} GB')
+
+    total_GB_PP_rank0 = model_param_grad_optimizer_PP_rank0 + (cached_total_PPrank0 + backward_temp) / 1024
     total_MB_PP_rank0 = total_GB_PP_rank0 * 1024
     print(f' -- [PP rank 0] total usage {total_GB_PP_rank0} GB')
     print(f' -- [PP rank 0] total usage {total_MB_PP_rank0} MB')
-    total_GB_PP_rank1 = rank_dense_mem + rank_moe_mem + (cached_total_PPrank1 + backward_temp) / 1024
+    total_GB_PP_rank1 = model_param_grad_optimizer_PP_rank1 + (cached_total_PPrank1 + backward_temp) / 1024
     total_MB_PP_rank1 = total_GB_PP_rank1 * 1024
     print(f' -- [PP rank 1] total usage {total_GB_PP_rank1} GB')
     print(f' -- [PP rank 1] total usage {total_MB_PP_rank1} MB')
@@ -357,32 +359,36 @@ def calc(name, seq_len,
     # print(f' -- full recompute cached for all PP microbatches: {input_mem * cached_layer_num / layers_per_pp / 1024} GB')
     # print(f' -- full recompute total usage {rank_dense_mem + rank_moe_mem + input_mem * cached_layer_num / layers_per_pp / 1024} GB')
     # print()
-
+    cached_layer_num_PPrank0 = cached_moe_layer_num_PPrank0 + cached_dense_layer_num_PPrank0
     # act_func_save = share_act_out + expert_act_out
     act_func_save = expert_linear_2_input_fp8
     act_func_save_total_PP_rank0 = act_func_save * cached_moe_layer_num_PPrank0
-    act_func_save_t = act_func_save * cached_layer_num_PPrank1
+    act_func_save_total_PP_rank1 = act_func_save * cached_layer_num_PPrank1
     print(f' --- By act_func recompute, can save {act_func_save} MB for 1 moe layer and 1 microbatch')
     print(f' --- [PP rank 0] By act_func recompute, can save {act_func_save_total_PP_rank0 / 1024} GB for all PP microbatches')
-    print(f' --- [PP rank 1] By act_func recompute, can save {act_func_save_t / 1024} GB for all PP microbatches')
+    print(f' --- [PP rank 1] By act_func recompute, can save {act_func_save_total_PP_rank1 / 1024} GB for all PP microbatches')
     norm_save = q_down_input_fp8 + kv_down_input_fp8 + mlp_norm_out
-    norm_save_t = norm_save * cached_layer_num_PPrank1
+    norm_save_total_PP_rank0 = norm_save * cached_layer_num_PPrank0
+    norm_save_total_PP_rank1 = norm_save * cached_layer_num_PPrank1
     print(f' --- By norm recompute, can save {norm_save} MB for 1 moe layer and 1 microbatch')
-    print(f' --- [PP rank 0 or 1] By norm recompute, can save {norm_save_t / 1024} GB for all PP microbatches')
-    up_proj_save = q_apply_rope_out + k_apply_rope_out + v_apply_rope_out
-    up_proj_save_t = up_proj_save * cached_layer_num_PPrank1
+    print(f' --- [PP rank 0] By norm recompute, can save {norm_save_total_PP_rank0 / 1024} GB for all PP microbatches')
+    print(f' --- [PP rank 1] By norm recompute, can save {norm_save_total_PP_rank1 / 1024} GB for all PP microbatches')
+    up_proj_save = q_norm_out_fp8 + q_norm_rms + kv_compressed + kv_norm_out_fp8 + kv_norm_rms + q_apply_rope_out + k_apply_rope_out + v_apply_rope_out
+    up_proj_save_total_PP_rank0 = up_proj_save * cached_layer_num_PPrank0
+    up_proj_save_total_PP_rank1 = up_proj_save * cached_layer_num_PPrank1
     print(f' --- By up_proj+rope recompute, can save {up_proj_save} MB for 1 moe layer and 1 microbatch')
-    print(f' --- [PP rank 0 or 1] By up_proj+rope recompute, can save {up_proj_save_t / 1024} GB for all PP microbatches')
-    cached_after_recompute_PP_rank0 = cached_total_PPrank0 - act_func_save_total_PP_rank0 - norm_save_t - up_proj_save_t
-    cached_after_recompute = cached_total_PPrank1 - act_func_save_t - norm_save_t - up_proj_save_t
+    print(f' --- [PP rank 0] By up_proj+rope recompute, can save {up_proj_save_total_PP_rank0 / 1024} GB for all PP microbatches')
+    print(f' --- [PP rank 1] By up_proj+rope recompute, can save {up_proj_save_total_PP_rank1 / 1024} GB for all PP microbatches')
+    cached_after_recompute_PP_rank0 = cached_total_PPrank0 - act_func_save_total_PP_rank0 - norm_save_total_PP_rank0 - up_proj_save_total_PP_rank0
+    cached_after_recompute_PP_rank1 = cached_total_PPrank1 - act_func_save_total_PP_rank1 - norm_save_total_PP_rank1 - up_proj_save_total_PP_rank1
     print(f' --- [PP rank 0] Cached size after the above recomputations: {cached_after_recompute_PP_rank0 / 1024} GB')
-    print(f' --- [PP rank 1] Cached size after the above recomputations: {cached_after_recompute / 1024} GB')
-    
-    total_GB_PP_rank0 = embedding_memory_param_grad_optimizer + rank_dense_layer_mem * first_k_dense + (rank_dense_mem + rank_moe_mem) / layers_per_pp * (layers_per_pp - first_k_dense) + (cached_after_recompute_PP_rank0 + backward_temp) / 1024
+    print(f' --- [PP rank 1] Cached size after the above recomputations: {cached_after_recompute_PP_rank1 / 1024} GB')
+
+    total_GB_PP_rank0 = model_param_grad_optimizer_PP_rank0 + (cached_after_recompute_PP_rank0 + backward_temp) / 1024
     total_MB_PP_rank0 = total_GB_PP_rank0 * 1024
     print(f' --- [PP rank 0] total usage after_recompute {total_GB_PP_rank0} GB')
     print(f' --- [PP rank 0] total usage after_recompute {total_MB_PP_rank0} MB')
-    total_GB_PP_rank1 = rank_dense_mem + rank_moe_mem + (cached_after_recompute + backward_temp) / 1024
+    total_GB_PP_rank1 = model_param_grad_optimizer_PP_rank1 + (cached_after_recompute_PP_rank1 + backward_temp) / 1024
     total_MB_PP_rank1 = total_GB_PP_rank1 * 1024
     print(f' --- [PP rank 1] total usage after_recompute {total_GB_PP_rank1} GB')
     print(f' --- [PP rank 1] total usage after_recompute {total_MB_PP_rank1} MB')
@@ -399,58 +405,67 @@ def calc(name, seq_len,
 
     fc1_offloading_save = expert_linear_1_input_fp8
     fc1_offloading_save_total_PP_rank0 = fc1_offloading_save * cached_moe_layer_num_PPrank0
-    fc1_offloading_save_t = fc1_offloading_save * cached_layer_num_PPrank1
+    fc1_offloading_save_total_PP_rank1 = fc1_offloading_save * cached_layer_num_PPrank1
     print(f' --- By fc1 offloading, can save {fc1_offloading_save} MB for 1 moe layer and 1 micobatch')
     print(f' --- [PP rank 0] By fc1 offloading, can save {fc1_offloading_save_total_PP_rank0 / 1024} GB for all PP microbatches')
-    print(f' --- [PP rank 1] By fc1 offloading, can save {fc1_offloading_save_t / 1024} GB for all PP microbatches')
+    print(f' --- [PP rank 1] By fc1 offloading, can save {fc1_offloading_save_total_PP_rank1 / 1024} GB for all PP microbatches')
     cached_after_recompute_offloading_PP_rank0 = cached_after_recompute_PP_rank0 - fc1_offloading_save_total_PP_rank0
-    cached_after_recompute_offloading = cached_after_recompute - fc1_offloading_save_t
+    cached_after_recompute_offloading_PP_rank1 = cached_after_recompute_PP_rank1 - fc1_offloading_save_total_PP_rank1
     print(f' --- [PP rank 0] Cached size after the above recomputations and offloading: {cached_after_recompute_offloading_PP_rank0 / 1024} GB')
-    print(f' --- [PP rank 1] Cached size after the above recomputations and offloading: {cached_after_recompute_offloading / 1024} GB')
-    total_GB_PP_rank0 = embedding_memory_param_grad_optimizer + rank_dense_layer_mem * first_k_dense + (rank_dense_mem + rank_moe_mem) / layers_per_pp * (layers_per_pp - first_k_dense) + (cached_after_recompute_offloading_PP_rank0 + backward_temp) / 1024
+    print(f' --- [PP rank 1] Cached size after the above recomputations and offloading: {cached_after_recompute_offloading_PP_rank1 / 1024} GB')
+    total_GB_PP_rank0 = model_param_grad_optimizer_PP_rank0 + (cached_after_recompute_offloading_PP_rank0 + backward_temp) / 1024
     total_MB_PP_rank0 = total_GB_PP_rank0 * 1024
     print(f' --- [PP rank 0] total usage after recompute & offloading {total_GB_PP_rank0} GB')
     print(f' --- [PP rank 0] total usage after recompute & offloading {total_MB_PP_rank0} MB')
-    total_GB_PP_rank1 = rank_dense_mem + rank_moe_mem + (cached_after_recompute_offloading + backward_temp) / 1024
+    total_GB_PP_rank1 = model_param_grad_optimizer_PP_rank1 + (cached_after_recompute_offloading_PP_rank1 + backward_temp) / 1024
     total_MB_PP_rank1 = total_GB_PP_rank1 * 1024
     print(f' --- [PP rank 1] total usage after recompute & offloading {total_GB_PP_rank1} GB')
     print(f' --- [PP rank 1] total usage after recompute & offloading {total_MB_PP_rank1} MB')
     print()
     
-    routed_expert_activation_save_PP_rank0 = routed_expert_cached * cached_moe_layer_num_PPrank0
-    routed_expert_activation_save_PP_rank1 = routed_expert_cached * cached_layer_num_PPrank1
-    print(f' --- [PP rank 0] By routed expert activation recompute, can save {routed_expert_activation_save_PP_rank0 / 1024} GB for all PP microbatches')
-    print(f' --- [PP rank 1] By routed expert activation recompute, can save {routed_expert_activation_save_PP_rank1 / 1024} GB for all PP microbatches')
-    cached_without_moe_PP_rank0 = cached_total_PPrank0 - routed_expert_activation_save_PP_rank0
-    cached_without_moe_PP_rank1 = cached_total_PPrank1 - routed_expert_activation_save_PP_rank1
+    moe_cached =router_probs + final_probs + permute_row_id_map + \
+        share_linear_1_input_fp8 + share_linear_1_out + share_linear_2_input_fp8 + \
+        expert_linear_1_input_fp8 + expert_linear_1_out + expert_linear_2_input_fp8
+    moe_activation_save_PP_rank0 = moe_cached * cached_moe_layer_num_PPrank0
+    moe_activation_save_PP_rank1 = moe_cached * cached_layer_num_PPrank1
+    print(f' --- [PP rank 0] By routed expert activation recompute, can save {moe_activation_save_PP_rank0 / 1024} GB for all PP microbatches')
+    print(f' --- [PP rank 1] By routed expert activation recompute, can save {moe_activation_save_PP_rank1 / 1024} GB for all PP microbatches')
+    cached_without_moe_PP_rank0 = cached_total_PPrank0 - moe_activation_save_PP_rank0
+    cached_without_moe_PP_rank1 = cached_total_PPrank1 - moe_activation_save_PP_rank1
     print(f' --- [PP rank 0] Cached size after the routed expert activation recompute: {cached_without_moe_PP_rank0 / 1024} GB')
     print(f' --- [PP rank 1] Cached size after the routed expert activation recompute: {cached_without_moe_PP_rank1 / 1024} GB')
-    total_GB_PP_rank0 = embedding_memory_param_grad_optimizer + rank_dense_layer_mem * first_k_dense + (rank_dense_mem + rank_moe_mem) / layers_per_pp * (layers_per_pp - first_k_dense) + (cached_without_moe_PP_rank0 + backward_temp) / 1024
+    total_GB_PP_rank0 = model_param_grad_optimizer_PP_rank0 + (cached_without_moe_PP_rank0 + backward_temp) / 1024
     total_MB_PP_rank0 = total_GB_PP_rank0 * 1024
     print(f' --- [PP rank 0] total usage after routed expert activation recompute {total_GB_PP_rank0} GB')
     print(f' --- [PP rank 0] total usage after routed expert activation recompute {total_MB_PP_rank0} MB')
-    total_GB_PP_rank1 = rank_dense_mem + rank_moe_mem + (cached_without_moe_PP_rank1 + backward_temp) / 1024
+    total_GB_PP_rank1 = model_param_grad_optimizer_PP_rank1 + (cached_without_moe_PP_rank1 + backward_temp) / 1024
     total_MB_PP_rank1 = total_GB_PP_rank1 * 1024
     print(f' --- [PP rank 1] total usage after routed expert activation recompute {total_GB_PP_rank1} GB')
     print(f' --- [PP rank 1] total usage after routed expert activation recompute {total_MB_PP_rank1} MB')
     print()
     
-    norm_mlaUpProj_expert_activation_save_PP_rank0 = routed_expert_cached * cached_moe_layer_num_PPrank0 + (q_down_input_fp8 + kv_down_input_fp8 + mlp_norm_out) * layers_per_pp * pp + (q_apply_rope_out + k_apply_rope_out + v_apply_rope_out) * layers_per_pp * pp
-    norm_mlaUpProj_expert_activation_save_PP_rank1 = routed_expert_cached * cached_layer_num_PPrank1 + (q_down_input_fp8 + kv_down_input_fp8 + mlp_norm_out) * cached_layer_num_PPrank1 + (q_apply_rope_out + k_apply_rope_out + v_apply_rope_out) * cached_layer_num_PPrank1
+    norm_mlaUpProj_expert_activation_save_PP_rank0 = moe_cached * cached_moe_layer_num_PPrank0 + norm_save * cached_layer_num_PPrank0 + up_proj_save * cached_layer_num_PPrank0
+    norm_mlaUpProj_expert_activation_save_PP_rank1 = moe_cached * cached_layer_num_PPrank1 + norm_save * cached_layer_num_PPrank1 + up_proj_save * cached_layer_num_PPrank1
     print(f' --- [PP rank 0] By (routed expert + norm + MLA up proj) activation recompute, can save {norm_mlaUpProj_expert_activation_save_PP_rank0 / 1024} GB for all PP microbatches')
     print(f' --- [PP rank 1] By (routed expert + norm + MLA up proj) activation recompute, can save {norm_mlaUpProj_expert_activation_save_PP_rank1 / 1024} GB for all PP microbatches')
     cached_without_norm_mlaUpProj_expert_PP_rank0 = cached_total_PPrank0 - norm_mlaUpProj_expert_activation_save_PP_rank0
     cached_without_norm_mlaUpProj_expert_PP_rank1 = cached_total_PPrank1 - norm_mlaUpProj_expert_activation_save_PP_rank1
     print(f' --- [PP rank 0] Cached size after (routed expert + norm + MLA up proj) activation recompute: {cached_without_norm_mlaUpProj_expert_PP_rank0 / 1024} GB')
     print(f' --- [PP rank 1] Cached size after (routed expert + norm + MLA up proj) activation recompute: {cached_without_norm_mlaUpProj_expert_PP_rank1 / 1024} GB')
-    total_GB_PP_rank0 = embedding_memory_param_grad_optimizer + rank_dense_layer_mem * first_k_dense + (rank_dense_mem + rank_moe_mem) / layers_per_pp * (layers_per_pp - first_k_dense) + (cached_without_norm_mlaUpProj_expert_PP_rank0 + backward_temp) / 1024
+    total_GB_PP_rank0_model = embedding_memory_param_grad_optimizer + rank_dense_layer_mem * first_k_dense + (rank_dense_mem + rank_moe_mem) / layers_per_pp * (layers_per_pp - first_k_dense)
+    total_GB_PP_rank0_activation = (cached_without_norm_mlaUpProj_expert_PP_rank0) / 1024
+    total_GB_PP_rank0 = total_GB_PP_rank0_model + total_GB_PP_rank0_activation + backward_temp / 1024
     total_MB_PP_rank0 = total_GB_PP_rank0 * 1024
     print(f' --- [PP rank 0] total usage after (routed expert + norm + MLA up proj) activation recompute {total_GB_PP_rank0} GB')
     print(f' --- [PP rank 0] total usage after (routed expert + norm + MLA up proj) activation recompute {total_MB_PP_rank0} MB')
-    total_GB_PP_rank1 = rank_dense_mem + rank_moe_mem + (cached_without_norm_mlaUpProj_expert_PP_rank1 + backward_temp) / 1024
+    print(f' --- [PP rank 0] model param+grad+optimizer usage after (routed expert + norm + MLA up proj) activation recompute {total_GB_PP_rank0_model * 1024} MB, activation usage {total_GB_PP_rank0_activation * 1024} MB')
+    total_GB_PP_rank1_model = rank_dense_mem + rank_moe_mem
+    total_GB_PP_rank1_activation = (cached_without_norm_mlaUpProj_expert_PP_rank1) / 1024
+    total_GB_PP_rank1 = total_GB_PP_rank1_model + total_GB_PP_rank1_activation + backward_temp / 1024
     total_MB_PP_rank1 = total_GB_PP_rank1 * 1024
     print(f' --- [PP rank 1] total usage after (routed expert + norm + MLA up proj) activation recompute {total_GB_PP_rank1} GB')
     print(f' --- [PP rank 1] total usage after (routed expert + norm + MLA up proj) activation recompute {total_MB_PP_rank1} MB')
+    print(f' --- [PP rank 1] model param+grad+optimizer usage after (routed expert + norm + MLA up proj) activation recompute {total_GB_PP_rank1_model * 1024} MB, activation usage {total_GB_PP_rank1_activation * 1024} MB')
     print()
     # shared_expert_save = share_linear_1_out + share_act_out
     # shared_expert_save_t = shared_expert_save * cached_layer_num
@@ -475,27 +490,27 @@ if __name__ == '__main__':
     #      shared_expert_num=1, mtp=1, gpus=8, pp=1, vpp=1, ep=8, tp=1, etp=1, 
     #      layers_per_pp=1, fsdp=False, fp8=False, fp8_per_block_free_rowwise_afer_fwd=True, routed_expert_capacity_factor=1.0, max_token_num_on_gpu=106039)
 
-    calc('moe_236b_lora', seq_len=4096,
-         n_layers=4, n_embed=5120, vocab_size=102400,
-         n_head=128, n_head_kv=128,
-         ff_factor=0.1125, n_experts=162, n_activated_experts=8,
-         ffn_hidden=12288, moe_ffn_hidden=1536,
-         q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
-         rope_head_dim=64, v_head_dim=128, first_k_dense=0,
-         shared_expert_num=2, mtp=1, gpus=8 * 2, pp=2, vpp=2, ep=8, tp=1, etp=1,
-         layers_per_pp=2, fsdp=False, fp8=True, fp8_per_block_free_rowwise_afer_fwd=True, 
-         routed_expert_capacity_factor=1.0, max_token_num_on_gpu=24640, ep_overlap=0) # 24576
+    # calc('moe_236b_lora', seq_len=4096,
+    #      n_layers=4, n_embed=5120, vocab_size=102400,
+    #      n_head=128, n_head_kv=128,
+    #      ff_factor=0.1125, n_experts=162, n_activated_experts=8,
+    #      ffn_hidden=12288, moe_ffn_hidden=1536,
+    #      q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
+    #      rope_head_dim=64, v_head_dim=128, first_k_dense=0,
+    #      shared_expert_num=2, mtp=1, gpus=8 * 2, pp=2, vpp=2, ep=8, tp=1, etp=1,
+    #      layers_per_pp=2, fsdp=False, fp8=True, fp8_per_block_free_rowwise_afer_fwd=True, 
+    #      routed_expert_capacity_factor=1.0, max_token_num_on_gpu=24640, ep_overlap=0) # 24576
     
-    # calc('kimi-k2', seq_len=4096,
-    #     n_layers=61, n_embed=7168, vocab_size=163840,
-    #     n_head=64, n_head_kv=64,
-    #     ff_factor=0.1125, n_experts=385, n_activated_experts=9,
-    #     ffn_hidden=18432, moe_ffn_hidden=2048,
-    #     q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
-    #     rope_head_dim=64, v_head_dim=128, first_k_dense=1,
-    #     shared_expert_num=1, mtp=1, gpus=8 * 1024, pp=32, vpp=1, ep=8, tp=1, etp=1, 
-    #     layers_per_pp=2, fsdp=False, fp8=True, fp8_per_block_free_rowwise_afer_fwd=True, 
-    #     routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 1.6, n_redundant_experts=8 * 1)
+    calc('kimi-k2', seq_len=4096,
+        n_layers=61, n_embed=7168, vocab_size=163840,
+        n_head=64, n_head_kv=64,
+        ff_factor=0.1125, n_experts=385, n_activated_experts=9,
+        ffn_hidden=18432, moe_ffn_hidden=2048,
+        q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
+        rope_head_dim=64, v_head_dim=128, first_k_dense=1,
+        shared_expert_num=1, mtp=1, gpus=8 * 31 * 4, pp=31, vpp=2, ep=8, tp=1, etp=1, 
+        layers_per_pp=2, fsdp=False, fp8=True, fp8_per_block_free_rowwise_afer_fwd=True, 
+        routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 1.01, n_redundant_experts=8 * 0)
     # kimi-k2: 61 layers = 1 dense layer + 60 moe layers + lm head. 1 mtp layer = 1 moe layer + 1 lm head + 1 2H->H Projection. 
     # when n_redundant_experts = 8 * 1 , maybe max_token_num_on_gpu=4096 * 8 * 1.6
     # when n_redundant_experts = 8 * 2 , maybe max_token_num_on_gpu=4096 * 8 * 1.2
