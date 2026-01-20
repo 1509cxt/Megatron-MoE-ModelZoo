@@ -585,13 +585,18 @@ def overlap_plot(name, seq_len,
     ALL2ALL_BYTES = 32768 * 7168
     NUM_INTRANODE = 8
 
+    ALL2ALL_COMM = ALL2ALL_BYTES / NUM_INTRANODE / MTLINK_P2P_BANDWITH * 1e3 * (NUM_INTRANODE - 1)
+    DISPATCH = ALL2ALL_COMM
+    COMBINE = ALL2ALL_COMM
     # OP time (ms)
     
     MOE_layer_MLA_preprocess_FORWARD = 11.4
     MOE_layer_MLP_FORWARD = 32.7
     MOE_layer_combine_postprocess_FORWARD = 2.2
+    MOE_layer_combine_FORWARD = COMBINE + MOE_layer_combine_postprocess_FORWARD
     
     MOE_layer_combine_postprocess_BACKWARD = 1
+    MOE_layer_combine_BACKWARD = COMBINE + MOE_layer_combine_postprocess_BACKWARD
     MOE_layer_MLP_BACKWARD = 60.9
     MOE_layer_preprocess_MLA_BACKWARD = 20.7
     
@@ -601,17 +606,21 @@ def overlap_plot(name, seq_len,
     DENSE_layer_MLP_BACKWARD = 14.3
     DENSE_layer_MLA_embedding_BACKWARD = 17.7
     
-    ALL2ALL_COMM = ALL2ALL_BYTES / NUM_INTRANODE / MTLINK_P2P_BANDWITH * 1e3 * (NUM_INTRANODE - 1)
-    DISPATCH = ALL2ALL_COMM
-    COMBINE = ALL2ALL_COMM
+    MOE_ACT1_BYTES = (share_linear_1_input_fp8 + share_linear_1_out + share_linear_2_input_fp8) * 1024 * 1024
+    MOE_OFFLOAD_ACT1 = MOE_ACT1_BYTES / PCIE_BANDWITH * 1e3
+    MOE_RELOAD_ACT1 = MOE_ACT1_BYTES / PCIE_BANDWITH * 1e3
 
-    ACT1_BYTES = (share_linear_1_input_fp8 + share_linear_1_out + share_linear_2_input_fp8) * 1024 * 1024
-    OFFLOAD_ACT1 = ACT1_BYTES / PCIE_BANDWITH * 1e3
-    RELOAD_ACT1 = ACT1_BYTES / PCIE_BANDWITH * 1e3
-
-    ACT2_BYTES = (expert_linear_1_input_fp8 + expert_linear_1_out) * 1024 * 1024
-    OFFLOAD_ACT2 = ACT2_BYTES / PCIE_BANDWITH * 1e3
-    RELOAD_ACT2 = ACT2_BYTES / PCIE_BANDWITH * 1e3
+    MOE_ACT2_BYTES = (expert_linear_1_input_fp8 + expert_linear_1_out) * 1024 * 1024
+    MOE_OFFLOAD_ACT2 = MOE_ACT2_BYTES / PCIE_BANDWITH * 1e3
+    MOE_RELOAD_ACT2 = MOE_ACT2_BYTES / PCIE_BANDWITH * 1e3
+    
+    DENSE_ACT1_BYTES = dense_linear_1_input_fp8 + dense_linear_2_input_fp8
+    DENSE_OFFLOAD_ACT1 = DENSE_ACT1_BYTES * 1024 * 1024 / PCIE_BANDWITH * 1e3
+    DENSE_RELOAD_ACT1 = DENSE_ACT1_BYTES * 1024 * 1024 / PCIE_BANDWITH * 1e3
+    
+    DENSE_ACT2_BYTES = dense_linear_1_out
+    DENSE_OFFLOAD_ACT2 = DENSE_ACT2_BYTES * 1024 * 1024 / PCIE_BANDWITH * 1e3
+    DENSE_RELOAD_ACT2 = DENSE_ACT2_BYTES * 1024 * 1024 / PCIE_BANDWITH * 1e3
 
     PP_COMM = 1.3
 
@@ -619,51 +628,146 @@ def overlap_plot(name, seq_len,
     bwd_color = "lightyellow"
     offload_color = "lightgreen"
     reload_color = "lightpink"
-    # 创建绘图器
-    plotter = MoEPipelinePlotter()
+    def moe_fwd_and_moe_bwd_overlap_with_moe_offload_and_moe_reload_plot():
+        # 创建绘图器
+        plotter = MoEPipelinePlotter()
 
-    plotter.add_block(StreamType.COMPUTE, MOE_layer_combine_postprocess_BACKWARD, label="B/comb post", color=fwd_color)
-
-    plotter.add_block(StreamType.COMPUTE, MOE_layer_MLA_preprocess_FORWARD, label="F/att", after_this_op="B/comb post",color=fwd_color)
-
-    plotter.add_block(StreamType.COMMUNICATION, COMBINE, label="B/combine", after_this_op="B/comb post", color=bwd_color)
-
-    plotter.add_block(StreamType.COMMUNICATION, OFFLOAD_ACT1, label="OFFLD_1", after_this_op="B/combine", color=offload_color)
-
-    plotter.add_block(StreamType.COMPUTE, MOE_layer_MLP_BACKWARD, label="B/mlp",after_this_op="B/combine", color=bwd_color)
-
-    plotter.add_block(StreamType.COMMUNICATION, DISPATCH, label="F/dispatch", after_this_op="F/att", color=fwd_color)
-
-    plotter.add_block(StreamType.COMMUNICATION, RELOAD_ACT2, label="RELD_2", after_this_op="F/dispatch", color=reload_color)
-
-    plotter.add_block(StreamType.COMMUNICATION, DISPATCH, label="B/dispatch", after_this_op="B/mlp", color=bwd_color)
-
-    plotter.add_block(StreamType.COMPUTE, MOE_layer_MLP_FORWARD, label="F/mlp", after_this_op="F/dispatch", color=fwd_color)
-
-    plotter.add_block(StreamType.COMMUNICATION, OFFLOAD_ACT2, label="OFFLD_2", after_this_op="B/dispatch", color=offload_color)
-
-    plotter.add_block(StreamType.COMPUTE, MOE_layer_preprocess_MLA_BACKWARD, label="B/att", after_this_op="B/dispatch", color=bwd_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_combine_postprocess_BACKWARD, label="B/comb post", color=bwd_color)
+        plotter.add_block(StreamType.COMPUTE, MOE_layer_MLA_preprocess_FORWARD, label="F/att", after_this_op="",color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_layer_combine_BACKWARD, label="B/combine", after_this_op="", color=bwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_OFFLOAD_ACT1, label="OFFLD_1", after_this_op="B/combine", color=offload_color)
+        plotter.add_block(StreamType.COMPUTE, MOE_layer_MLP_BACKWARD, label="B/mlp",after_this_op="B/combine", color=bwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, DISPATCH, label="F/dispatch", after_this_op="F/att", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_RELOAD_ACT2, label="RELD_2", after_this_op="F/dispatch", color=reload_color)
+        plotter.add_block(StreamType.COMMUNICATION, DISPATCH, label="B/dispatch", after_this_op="B/mlp", color=bwd_color)
+        plotter.add_block(StreamType.COMPUTE, MOE_layer_MLP_FORWARD, label="F/mlp", after_this_op="F/dispatch", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_OFFLOAD_ACT2, label="OFFLD_2", after_this_op="B/dispatch", color=offload_color)
+        plotter.add_block(StreamType.COMPUTE, MOE_layer_preprocess_MLA_BACKWARD, label="B/att", after_this_op="B/dispatch", color=bwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_layer_combine_FORWARD, label="F/combine", after_this_op="F/mlp", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_RELOAD_ACT1, label="RELD_1", after_this_op="F/combine", color=reload_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_combine_postprocess_FORWARD, label="F/comb post", after_this_op="F/combine", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, PP_COMM, label="B/pp", after_this_op="B/att", color=bwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, PP_COMM, label="F/pp", after_this_op="F/combine", color=fwd_color)
+        # 绘制
+        plotter.plot()
+        # 如果想保存图像就注释这行show的代码
+        # plotter.show()
+        
+        # 保存图像
+        print("Saved moe_fwd_and_moe_bwd_overlap.png")
+        plotter.save("moe_fwd_and_moe_bwd_overlap.png")
     
-    plotter.add_block(StreamType.COMMUNICATION, COMBINE, label="F/combine", after_this_op="F/mlp", color=fwd_color)
-    
-    plotter.add_block(StreamType.COMMUNICATION, RELOAD_ACT1, label="RELD_1", after_this_op="F/combine", color=reload_color)
+    def dense_fwd_and_moe_bwd_overlap_with_moe_offload_and_moe_reload_plot():
+        # 创建绘图器
+        plotter = MoEPipelinePlotter()
 
-    plotter.add_block(StreamType.COMPUTE, MOE_layer_combine_postprocess_FORWARD, label="F/comb post", after_this_op="F/combine", color=fwd_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_combine_postprocess_BACKWARD, label="B/comb post", color=bwd_color)
+        plotter.add_block(StreamType.COMPUTE, DENSE_layer_MLA_FORWARD, label="F/att", after_this_op="",color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_layer_combine_BACKWARD, label="B/combine", after_this_op="", color=bwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_OFFLOAD_ACT1, label="OFFLD_1", after_this_op="B/combine", color=offload_color)
+        plotter.add_block(StreamType.COMPUTE, MOE_layer_MLP_BACKWARD, label="B/mlp",after_this_op="B/combine", color=bwd_color)
+        # plotter.add_block(StreamType.COMMUNICATION, DISPATCH, label="F/dispatch", after_this_op="F/att", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_RELOAD_ACT2, label="RELD_2", after_this_op="F/dispatch", color=reload_color)
+        plotter.add_block(StreamType.COMMUNICATION, DISPATCH, label="B/dispatch", after_this_op="B/mlp", color=bwd_color)
+        plotter.add_block(StreamType.COMPUTE, DENSE_layer_MLP_FORWARD, label="F/mlp", after_this_op="F/dispatch", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_OFFLOAD_ACT2, label="OFFLD_2", after_this_op="B/dispatch", color=offload_color)
+        plotter.add_block(StreamType.COMPUTE, MOE_layer_preprocess_MLA_BACKWARD, label="B/att", after_this_op="B/dispatch", color=bwd_color)
+        # plotter.add_block(StreamType.COMMUNICATION, MOE_layer_combine_FORWARD, label="F/combine", after_this_op="F/mlp", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_RELOAD_ACT1, label="RELD_1", after_this_op="F/combine", color=reload_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_combine_postprocess_FORWARD, label="F/comb post", after_this_op="F/combine", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, PP_COMM, label="B/pp", after_this_op="B/att", color=bwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, PP_COMM, label="F/pp", after_this_op="F/combine", color=fwd_color)
+        # 绘制
+        plotter.plot()
+        # 如果想保存图像就注释这行show的代码
+        # plotter.show()
+        
+        # 保存图像
+        print("Saved dense_fwd_and_moe_bwd_overlap_with_moe_offload_and_moe_reload.png")
+        plotter.save("dense_fwd_and_moe_bwd_overlap_with_moe_offload_and_moe_reload.png")
+        
+    def moe_fwd_with_moe_offload_plot():
+        # 创建绘图器
+        plotter = MoEPipelinePlotter()
 
-    plotter.add_block(StreamType.COMMUNICATION, PP_COMM, label="B/pp", after_this_op="B/att", color=bwd_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_combine_postprocess_BACKWARD, label="B/comb post", color=bwd_color)
+        plotter.add_block(StreamType.COMPUTE, MOE_layer_MLA_preprocess_FORWARD, label="F/att", after_this_op="",color=fwd_color)
+        # plotter.add_block(StreamType.COMMUNICATION, MOE_layer_combine_BACKWARD, label="B/combine", after_this_op="", color=bwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_OFFLOAD_ACT1, label="OFFLD_1", after_this_op="B/combine", color=offload_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_MLP_BACKWARD, label="B/mlp",after_this_op="B/combine", color=bwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, DISPATCH, label="F/dispatch", after_this_op="F/att", color=fwd_color)
+        # plotter.add_block(StreamType.COMMUNICATION, RELOAD_ACT2, label="RELD_2", after_this_op="F/dispatch", color=reload_color)
+        # plotter.add_block(StreamType.COMMUNICATION, DISPATCH, label="B/dispatch", after_this_op="B/mlp", color=bwd_color)
+        plotter.add_block(StreamType.COMPUTE, MOE_layer_MLP_FORWARD, label="F/mlp", after_this_op="F/dispatch", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_OFFLOAD_ACT2, label="OFFLD_2", after_this_op="B/dispatch", color=offload_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_preprocess_MLA_BACKWARD, label="B/att", after_this_op="B/dispatch", color=bwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_layer_combine_FORWARD, label="F/combine", after_this_op="F/mlp", color=fwd_color)
+        # plotter.add_block(StreamType.COMMUNICATION, RELOAD_ACT1, label="RELD_1", after_this_op="F/combine", color=reload_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_combine_postprocess_FORWARD, label="F/comb post", after_this_op="F/combine", color=fwd_color)
+        # plotter.add_block(StreamType.COMMUNICATION, PP_COMM, label="B/pp", after_this_op="B/att", color=bwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, PP_COMM, label="F/pp", after_this_op="F/combine", color=fwd_color)
+        # 绘制
+        plotter.plot()
+        # 如果想保存图像就注释这行show的代码
+        # plotter.show()
+        
+        # 保存图像
+        print("Saved moe_fwd_with_moe_offload.png")
+        plotter.save("moe_fwd_with_moe_offload.png")
+    
+        
+    def moe_bwd_with_moe_reload_plot():
+        # 创建绘图器
+        plotter = MoEPipelinePlotter()
 
-    plotter.add_block(StreamType.COMMUNICATION, PP_COMM, label="F/pp", after_this_op="F/comb post", color=fwd_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_combine_postprocess_BACKWARD, label="B/comb post", color=bwd_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_MLA_preprocess_FORWARD, label="F/att", after_this_op="",color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_layer_combine_BACKWARD, label="B/combine", after_this_op="", color=bwd_color)
+        # plotter.add_block(StreamType.COMMUNICATION, MOE_OFFLOAD_ACT1, label="OFFLD_1", after_this_op="B/combine", color=offload_color)
+        plotter.add_block(StreamType.COMPUTE, MOE_layer_MLP_BACKWARD, label="B/mlp",after_this_op="B/combine", color=bwd_color)
+        # plotter.add_block(StreamType.COMMUNICATION, DISPATCH, label="F/dispatch", after_this_op="F/att", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_RELOAD_ACT2, label="RELD_2", after_this_op="F/dispatch", color=reload_color)
+        plotter.add_block(StreamType.COMMUNICATION, DISPATCH, label="B/dispatch", after_this_op="B/mlp", color=bwd_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_MLP_FORWARD, label="F/mlp", after_this_op="F/dispatch", color=fwd_color)
+        # plotter.add_block(StreamType.COMMUNICATION, MOE_OFFLOAD_ACT2, label="OFFLD_2", after_this_op="B/dispatch", color=offload_color)
+        plotter.add_block(StreamType.COMPUTE, MOE_layer_preprocess_MLA_BACKWARD, label="B/att", after_this_op="B/dispatch", color=bwd_color)
+        # plotter.add_block(StreamType.COMMUNICATION, MOE_layer_combine_FORWARD, label="F/combine", after_this_op="F/mlp", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, MOE_RELOAD_ACT1, label="RELD_1", after_this_op="F/combine", color=reload_color)
+        # plotter.add_block(StreamType.COMPUTE, MOE_layer_combine_postprocess_FORWARD, label="F/comb post", after_this_op="F/combine", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, PP_COMM, label="B/pp", after_this_op="B/att", color=bwd_color)
+        # plotter.add_block(StreamType.COMMUNICATION, PP_COMM, label="F/pp", after_this_op="F/combine", color=fwd_color)
+        # 绘制
+        plotter.plot()
+        # 如果想保存图像就注释这行show的代码
+        # plotter.show()
+        
+        # 保存图像
+        print("Saved moe_bwd_with_moe_reload_.png")
+        plotter.save("moe_bwd_with_moe_reload_.png")
     
-    # 绘制
-    plotter.plot()
     
-    # 如果想保存图像就注释这行show的代码
-    # plotter.show()
-    
-    # 保存图像
-    print("Saved overlap_schedule.png")
-    plotter.save("overlap_schedule.png")
-
+    def dense_fwd_with_dense_offload_plot():
+        # 创建绘图器
+        plotter = MoEPipelinePlotter()
+        plotter.add_block(StreamType.COMPUTE, DENSE_layer_MLA_FORWARD, label="F/att", after_this_op="",color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, DENSE_OFFLOAD_ACT1, label="OFFLD_1", after_this_op="B/combine", color=offload_color)
+        plotter.add_block(StreamType.COMPUTE, DENSE_layer_MLP_FORWARD, label="F/mlp", after_this_op="F/dispatch", color=fwd_color)
+        plotter.add_block(StreamType.COMMUNICATION, DENSE_OFFLOAD_ACT2, label="OFFLD_2", after_this_op="B/dispatch", color=offload_color)
+        plotter.add_block(StreamType.COMMUNICATION, PP_COMM, label="F/pp", after_this_op="F/combine", color=fwd_color)
+        # 绘制
+        plotter.plot()
+        # 如果想保存图像就注释这行show的代码
+        # plotter.show()
+        
+        # 保存图像
+        print("Saved dense_fwd_with_dense_offload.png")
+        plotter.save("dense_fwd_with_dense_offload.png")
+        
+    # moe_fwd_and_moe_bwd_overlap_with_offload_plot()
+    # dense_fwd_and_moe_bwd_overlap_with_offload_plot()
+    # moe_fwd_with_offload_moe_plot()
+    # moe_bwd_with_reload_plot()
+    dense_fwd_with_dense_offload_plot()
 
 if __name__ == "__main__":
     overlap_plot('kimi-k2', seq_len=4096,
