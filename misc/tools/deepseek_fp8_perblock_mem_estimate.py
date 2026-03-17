@@ -206,6 +206,8 @@ def calc(name, seq_len,
     attn_ctx_tensor = 1 * n_head / tp * seq_len * 1 * fp32_mb_coeff # flash_attn_func
     
     attn_out_proj_input_fp8 = seq_len * 1 * n_head * v_head_dim / tp * fp8_per_block_mb_coeff
+    attn_out_proj_input_fp8 = attn_out_proj_input_fp8 if fp8 else 0
+    
     proj_out = seq_len * 1 * n_embed / tp * bf16_mb_coeff
     attn_bda_out = proj_out
     
@@ -261,7 +263,8 @@ def calc(name, seq_len,
     unpermute_out = unpermute_alltoall_out / topk
     mlp_bda_out = unpermute_out
     routed_expert_cached = expert_linear_1_input_fp8 + expert_linear_1_out + expert_linear_2_input_fp8
-    cached = input_mem + input_norm_rms + q_down_input_fp8 +q_down_out + kv_down_input_fp8 + kv_down_out + q_norm_out_fp8 + q_norm_rms + kv_compressed + kv_norm_out_fp8 + kv_norm_rms + q_apply_rope_out + k_apply_rope_out + v_apply_rope_out + attn_out + attn_out_proj_input_fp8 + attn_ctx_tensor + \
+    cached = input_mem + input_norm_rms + q_down_input_fp8 +q_down_out + kv_down_input_fp8 + kv_down_out + q_norm_out_fp8 + q_norm_rms + kv_compressed + kv_norm_out_fp8 + kv_norm_rms + \
+        q_apply_rope_out + k_apply_rope_out + v_apply_rope_out + attn_out + attn_out_proj_input_fp8 + attn_ctx_tensor + \
         attn_bda_out + mlp_norm_out + mlp_norm_rms +\
         router_probs + final_probs + permute_row_id_map + \
         share_linear_1_input_fp8 + share_linear_1_out + share_linear_2_input_fp8 + \
@@ -301,8 +304,10 @@ def calc(name, seq_len,
     
 
     backward_temp = unpermute_alltoall_out + expert_act_out * 12 - expert_linear_2_input_fp8
-    if ep_overlap:
-        backward_temp += backward_temp + cached
+    if vpp > 1:
+        backward_temp = expert_linear_1_input_fp8 + expert_linear_1_out + input_mem * 5 + expert_linear_1_input_fp8 * 2 + expert_linear_1_out * 3.5 + unpermute_alltoall_out * 2
+    if vpp > 1 and ep_overlap:
+        backward_temp += input_mem * 5 + unpermute_alltoall_out + unpermute_alltoall_out * 2 * 0.632 + expert_linear_1_out * 2.5
     #cached_total_PPrank1 += (seq_len * 1 * n_embed / tp * bf16_mb_coeff) * (vpp+1)  # vpp/pp stage's p2p buffer
     embedding_memory_param_grad_optimizer = n_embed * vocab_size * (6+12/dense_dp) / 1024**3
     # print(f' -- input tensor: {input_mem} MB, cached by input norm            {input_mem / cached * 100:.2f}%')
@@ -374,7 +379,7 @@ def calc(name, seq_len,
     print(f' --- By act_func recompute, can save {act_func_save} MB for 1 moe layer and 1 microbatch')
     print(f' --- [PP rank 0] By act_func recompute, can save {act_func_save_total_PP_rank0 / 1024} GB for all PP microbatches')
     print(f' --- [PP rank 1] By act_func recompute, can save {act_func_save_total_PP_rank1 / 1024} GB for all PP microbatches')
-    norm_save = q_down_input_fp8 + kv_down_input_fp8 + mlp_norm_out
+    norm_save = q_down_input_fp8 + kv_down_input_fp8 + mlp_norm_out + share_linear_1_input_fp8
     norm_save_total_PP_rank0 = norm_save * cached_layer_num_PPrank0
     norm_save_total_PP_rank1 = norm_save * cached_layer_num_PPrank1
     print(f' --- By norm recompute, can save {norm_save} MB for 1 moe layer and 1 microbatch')
@@ -479,7 +484,8 @@ def calc(name, seq_len,
     print(f' --- [PP rank 1] model param+grad+optimizer usage after (routed expert + norm + MLA up proj) activation recompute {total_GB_PP_rank1_model * 1024} MB, activation usage {total_GB_PP_rank1_activation * 1024} MB')
     print()
     # share_linear_1_input_fp8 + share_linear_1_out + share_linear_2_input_fp8
-    moe_mlp_cached =  expert_linear_1_input_fp8 + expert_linear_1_out + expert_linear_2_input_fp8
+    # expert_linear_1_input_fp8 + expert_linear_1_out + expert_linear_2_input_fp8 
+    moe_mlp_cached = expert_linear_1_input_fp8 + expert_linear_1_out + expert_linear_2_input_fp8 + share_linear_1_out + share_linear_2_input_fp8
     dense_mlp_cached = dense_linear_1_input_fp8 + dense_linear_1_out + dense_linear_2_input_fp8 
     offloading_cached = expert_linear_1_input_fp8 + expert_linear_1_out 
     activation_on_cpu_for_each_gpu_PP_rank0 = offloading_cached * cached_moe_layer_num_PPrank0
@@ -534,26 +540,59 @@ if __name__ == '__main__':
     #      layers_per_pp=1, fsdp=False, fp8=False, fp8_per_block_free_rowwise_afer_fwd=True, routed_expert_capacity_factor=1.0, max_token_num_on_gpu=106039)
 
     # calc('moe_236b_lora', seq_len=4096,
-    #      n_layers=4, n_embed=5120, vocab_size=102400,
+    #      n_layers=60, n_embed=5120, vocab_size=102400,
     #      n_head=128, n_head_kv=128,
     #      ff_factor=0.1125, n_experts=162, n_activated_experts=8,
     #      ffn_hidden=12288, moe_ffn_hidden=1536,
     #      q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
-    #      rope_head_dim=64, v_head_dim=128, first_k_dense=0,
-    #      shared_expert_num=2, mtp=1, gpus=8 * 2, pp=2, vpp=2, ep=8, tp=1, etp=1,
-    #      layers_per_pp=2, fsdp=False, fp8=True, fp8_per_block_free_rowwise_afer_fwd=True, 
-    #      routed_expert_capacity_factor=1.0, max_token_num_on_gpu=24640, ep_overlap=0) # 24576
+    #      rope_head_dim=64, v_head_dim=128, first_k_dense=1,
+    #      shared_expert_num=2, mtp=1, gpus=8 * 16, pp=16, vpp=1, ep=8, tp=1, etp=1,
+    #      layers_per_pp=4, fsdp=False, fp8=False, fp8_per_block_free_rowwise_afer_fwd=True, 
+    #      routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 3, ep_overlap=0) # 24576
     
-    # calc('kimi-k2-61Layer-384expert-3968GPU-k=1.2', seq_len=4096,
-    #     n_layers=61, n_embed=7168, vocab_size=163840,
+    # calc('kimi-k2-16Layer-384expert-3968GPU-k=1.2', seq_len=4096,
+    #     n_layers=16, n_embed=7168, vocab_size=163840,
     #     n_head=64, n_head_kv=64,
     #     ff_factor=0.1125, n_experts=384+1, n_activated_experts=9,
     #     ffn_hidden=18432, moe_ffn_hidden=2048,
     #     q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
     #     rope_head_dim=64, v_head_dim=128, first_k_dense=1,
-    #     shared_expert_num=1, mtp=1, gpus=8 * 31 * 16, pp=31, vpp=2, ep=8, tp=1, etp=1, 
-    #     layers_per_pp=2, fsdp=False, fp8=True, fp8_per_block_free_rowwise_afer_fwd=True, 
+    #     shared_expert_num=1, mtp=1, gpus=8 * 8 * 4, pp=8, vpp=2, ep=8, tp=1, etp=1, 
+    #     layers_per_pp=2, fsdp=False, fp8=False, fp8_per_block_free_rowwise_afer_fwd=True, 
     #     routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 1.2, n_redundant_experts=8 * 0, ep_overlap=1)
+    
+    calc('kimi-k2-61Layer-384expert-744GPU-k=3', seq_len=4096,
+        n_layers=61, n_embed=7168, vocab_size=163840,
+        n_head=64, n_head_kv=64,
+        ff_factor=0.1125, n_experts=384+1, n_activated_experts=9,
+        ffn_hidden=18432, moe_ffn_hidden=2048,
+        q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
+        rope_head_dim=64, v_head_dim=128, first_k_dense=1,
+        shared_expert_num=1, mtp=1, gpus=31 * 8 * 4, pp=31, vpp=2, ep=8, tp=1, etp=1, 
+        layers_per_pp=2, fsdp=False, fp8=False, fp8_per_block_free_rowwise_afer_fwd=True, 
+        routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 1.2, n_redundant_experts=8 * 0, ep_overlap=0)
+    
+    # calc('kimi-k2-7Layer-384expert-64GPU-k=1', seq_len=4096,
+    #     n_layers=7, n_embed=7168, vocab_size=163840,
+    #     n_head=64, n_head_kv=64,
+    #     ff_factor=0.1125, n_experts=384+1, n_activated_experts=9,
+    #     ffn_hidden=18432, moe_ffn_hidden=2048,
+    #     q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
+    #     rope_head_dim=64, v_head_dim=128, first_k_dense=1,
+    #     shared_expert_num=1, mtp=1, gpus=8 * 8, pp=4, vpp=2, ep=8, tp=1, etp=1, 
+    #     layers_per_pp=2, fsdp=False, fp8=False, fp8_per_block_free_rowwise_afer_fwd=True, 
+    #     routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 1, n_redundant_experts=8 * 0, ep_overlap=0)
+    
+    # calc('kimi-k2-10Layer-384expert-80GPU-k=1.2', seq_len=4096,
+    #     n_layers=8, n_embed=7168, vocab_size=163840,
+    #     n_head=64, n_head_kv=64,
+    #     ff_factor=0.1125, n_experts=384+1, n_activated_experts=9,
+    #     ffn_hidden=18432, moe_ffn_hidden=2048,
+    #     q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
+    #     rope_head_dim=64, v_head_dim=128, first_k_dense=1,
+    #     shared_expert_num=1, mtp=1, gpus=8 * 8, pp=4, vpp=2, ep=8, tp=1, etp=1, 
+    #     layers_per_pp=2, fsdp=False, fp8=False, fp8_per_block_free_rowwise_afer_fwd=True, 
+    #     routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 1, n_redundant_experts=8 * 0, ep_overlap=0)
     
     # calc('kimi-k2-61Layer-384expert-3968GPU-k=3', seq_len=4096,
     #     n_layers=61, n_embed=7168, vocab_size=163840,
@@ -621,16 +660,16 @@ if __name__ == '__main__':
     #     layers_per_pp=2, fsdp=False, fp8=True, fp8_per_block_free_rowwise_afer_fwd=True, 
     #     routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 1.2, n_redundant_experts=8 * 0, ep_overlap=1)
     
-    calc('kimi-k2-81Layer-384expert-7872GPU-k=3', seq_len=4096,
-        n_layers=81, n_embed=7168, vocab_size=163840,
-        n_head=64, n_head_kv=64,
-        ff_factor=0.1125, n_experts=384+1, n_activated_experts=9,
-        ffn_hidden=18432, moe_ffn_hidden=2048,
-        q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
-        rope_head_dim=64, v_head_dim=128, first_k_dense=1,
-        shared_expert_num=1, mtp=1, gpus=8 * 41 * 24, pp=41, vpp=2, ep=8, tp=1, etp=1, 
-        layers_per_pp=2, fsdp=False, fp8=True, fp8_per_block_free_rowwise_afer_fwd=True, 
-        routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 3, n_redundant_experts=8 * 0, ep_overlap=1)
+    # calc('kimi-k2-81Layer-384expert-7872GPU-k=3', seq_len=4096,
+    #     n_layers=81, n_embed=7168, vocab_size=163840,
+    #     n_head=64, n_head_kv=64,
+    #     ff_factor=0.1125, n_experts=384+1, n_activated_experts=9,
+    #     ffn_hidden=18432, moe_ffn_hidden=2048,
+    #     q_lora_rank=1536, k_lora_rank=512, v_lora_rank=512, qk_head_dim=192,
+    #     rope_head_dim=64, v_head_dim=128, first_k_dense=1,
+    #     shared_expert_num=1, mtp=1, gpus=8 * 41 * 24, pp=41, vpp=2, ep=8, tp=1, etp=1, 
+    #     layers_per_pp=2, fsdp=False, fp8=True, fp8_per_block_free_rowwise_afer_fwd=True, 
+    #     routed_expert_capacity_factor=1.0, max_token_num_on_gpu=4096 * 8 * 1.2, n_redundant_experts=8 * 0, ep_overlap=1)
     
     # kimi-k2: 61 layers = 1 dense layer + 60 moe layers + lm head. 1 mtp layer = 1 moe layer + 1 lm head + 1 2H->H Projection. 
     # when n_redundant_experts = 8 * 1 , maybe max_token_num_on_gpu=4096 * 8 * 1.6
